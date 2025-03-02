@@ -26,8 +26,6 @@ use esp_mbedtls_sys::bindings::*;
 ))]
 use esp_wifi as _;
 
-#[cfg(feature = "edge-nal")]
-mod edge_nal;
 #[cfg(any(
     feature = "esp32",
     feature = "esp32c3",
@@ -959,6 +957,8 @@ pub mod asynch {
     use core::pin::pin;
     use core::task::{Context, Poll};
 
+    use embassy_futures::yield_now;
+    use embassy_sync::blocking_mutex::raw::NoopRawMutex;
     use embedded_io::Error;
 
     use super::*;
@@ -968,16 +968,6 @@ pub mod asynch {
     pub mod io {
         pub use embedded_io_async::*;
     }
-
-    /// Re-export of the `edge-nal` crate so that users don't have to explicitly depend on it
-    /// to use e.g. `TlsAccept` and `TlsConnect` methods.
-    #[cfg(feature = "edge-nal")]
-    pub mod nal {
-        pub use crate::edge_nal::*;
-    }
-
-    #[cfg(feature = "edge-nal")]
-    pub use super::edge_nal::*;
 
     /// An async TLS session over a stream represented by `embedded-io-async`'s `Read` and `Write` traits.
     pub struct Session<'a, T> {
@@ -989,8 +979,6 @@ pub mod asynch {
         client_crt: *mut mbedtls_x509_crt,
         private_key: *mut mbedtls_pk_context,
         state: SessionState,
-        read_byte: Option<u8>,
-        write_byte: Option<u8>,
         _token: TlsReference<'a>,
     }
 
@@ -1030,10 +1018,14 @@ pub mod asynch {
                 client_crt,
                 private_key,
                 state: SessionState::Initial,
-                read_byte: None,
-                write_byte: None,
                 _token: tls_ref,
             })
+        }
+
+        pub fn share(self) -> SharedSession<'a, T> {
+            SharedSession {
+                session: embassy_sync::mutex::Mutex::new(self),
+            }
         }
     }
 
@@ -1058,9 +1050,16 @@ pub mod asynch {
         }
     }
 
-    impl<T> Session<'_, T>
+    pub struct SharedSession<'a, T> {
+        session: embassy_sync::mutex::Mutex<NoopRawMutex, Session<'a, T>>,
+    }
+
+    impl<T> SharedSession<'_, T>
     where
-        T: embedded_io_async::Read + embedded_io_async::Write,
+        T: embedded_io_async::Read
+            + embedded_io_async::ReadReady
+            + embedded_io_async::Write
+            + embedded_io_async::WriteReady,
     {
         /// Negotiate the TLS connection
         ///
@@ -1068,17 +1067,24 @@ pub mod asynch {
         ///
         /// Note that calling it is not mandatory, because the TLS session is anyway
         /// negotiated during the first read or write operation.
-        pub async fn connect(&mut self) -> Result<(), TlsError> {
-            match self.state {
+        pub async fn connect(&self) -> Result<(), TlsError> {
+            let mut session = self.session.lock().await;
+            match session.state {
                 SessionState::Initial => {
                     log::debug!("Establishing SSL connection");
 
-                    self.io(|ssl| unsafe { mbedtls_ssl_handshake(ssl) }).await?;
-                    if matches!(self.state, SessionState::Eof) {
+                    while let None = session
+                        .try_io(|ssl| unsafe { mbedtls_ssl_handshake(ssl) })
+                        .await?
+                    {
+                        yield_now().await;
+                    }
+
+                    if matches!(session.state, SessionState::Eof) {
                         return Err(TlsError::Eof);
                     }
 
-                    self.state = SessionState::Connected;
+                    session.state = SessionState::Connected;
 
                     Ok(())
                 }
@@ -1096,14 +1102,26 @@ pub mod asynch {
         /// # Returns
         ///
         /// The number of bytes read or an error
-        pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, TlsError> {
+        pub async fn read(&self, buf: &mut [u8]) -> Result<usize, TlsError> {
             self.connect().await?;
 
-            let len = self
-                .io(|ssl| unsafe {
-                    mbedtls_ssl_read(ssl, buf.as_mut_ptr() as *mut _, buf.len() as _)
-                })
-                .await?;
+            let len = loop {
+                match self
+                    .session
+                    .lock()
+                    .await
+                    .try_io(|ssl| unsafe {
+                        mbedtls_ssl_read(ssl, buf.as_mut_ptr() as *mut _, buf.len() as _)
+                    })
+                    .await?
+                {
+                    Some(len) => break len as usize,
+                    None => {
+                        yield_now().await;
+                        continue;
+                    }
+                }
+            };
 
             Ok(len as _)
         }
@@ -1117,14 +1135,26 @@ pub mod asynch {
         /// Returns:
         ///
         /// The number of bytes written or an error
-        pub async fn write(&mut self, data: &[u8]) -> Result<usize, TlsError> {
+        pub async fn write(&self, data: &[u8]) -> Result<usize, TlsError> {
             self.connect().await?;
 
-            let len = self
-                .io(|ssl| unsafe {
-                    mbedtls_ssl_write(ssl, data.as_ptr() as *const _, data.len() as _)
-                })
-                .await?;
+            let len = loop {
+                match self
+                    .session
+                    .lock()
+                    .await
+                    .try_io(|ssl| unsafe {
+                        mbedtls_ssl_write(ssl, data.as_ptr() as *const _, data.len() as _)
+                    })
+                    .await?
+                {
+                    Some(len) => break len as usize,
+                    None => {
+                        yield_now().await;
+                        continue;
+                    }
+                }
+            };
 
             Ok(len as _)
         }
@@ -1136,16 +1166,15 @@ pub mod asynch {
         /// Returns:
         ///
         /// An error if the flush failed
-        pub async fn flush(&mut self) -> Result<(), TlsError> {
+        pub async fn flush(&self) -> Result<(), TlsError> {
             self.connect().await?;
 
-            self.flush_write().await?;
-            self.stream
+            let mut session = self.session.lock().await;
+            session
+                .stream
                 .flush()
                 .await
-                .map_err(|e| TlsError::Io(e.kind()))?;
-
-            Ok(())
+                .map_err(|err| TlsError::Io(err.kind()))
         }
 
         /// Close the TLS connection
@@ -1155,133 +1184,89 @@ pub mod asynch {
         /// Returns:
         ///
         /// An error if the close failed
-        pub async fn close(&mut self) -> Result<(), TlsError> {
+        pub async fn close(&self) -> Result<(), TlsError> {
             self.connect().await?;
 
-            self.io(|ssl| unsafe { mbedtls_ssl_close_notify(ssl) })
-                .await?;
-            self.flush().await?;
+            let mut session = self.session.lock().await;
 
-            self.state = SessionState::Eof;
+            while let None = session
+                .try_io(|ssl| unsafe { mbedtls_ssl_close_notify(ssl) })
+                .await?
+            {
+                yield_now().await;
+            }
+
+            session
+                .stream
+                .flush()
+                .await
+                .map_err(|err| TlsError::Io(err.kind()))?;
+
+            session.state = SessionState::Eof;
 
             Ok(())
         }
+    }
 
+    impl<T> embedded_io_async::ErrorType for &SharedSession<'_, T> {
+        type Error = TlsError;
+    }
+
+    impl<T> embedded_io_async::Read for &SharedSession<'_, T>
+    where
+        T: embedded_io_async::Read
+            + embedded_io_async::ReadReady
+            + embedded_io_async::Write
+            + embedded_io_async::WriteReady,
+    {
+        async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+            (&*self).read(buf).await
+        }
+    }
+
+    impl<T> embedded_io_async::Write for &SharedSession<'_, T>
+    where
+        T: embedded_io_async::Read
+            + embedded_io_async::ReadReady
+            + embedded_io_async::Write
+            + embedded_io_async::WriteReady,
+    {
+        async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+            (&*self).write(buf).await
+        }
+
+        async fn flush(&mut self) -> Result<(), Self::Error> {
+            (&*self).flush().await
+        }
+    }
+
+    impl<'a, T> Session<'a, T>
+    where
+        T: embedded_io_async::Read
+            + embedded_io_async::ReadReady
+            + embedded_io_async::Write
+            + embedded_io_async::WriteReady,
+    {
         /// Perform an async IO operation on the TLS connection, by calling the
         /// provided MbedTLS function.
         ///
         /// The MbedTLS function is usually either `mbedtls_ssl_read`, `mbedtls_ssl_write` or `mbedtls_ssl_handshake`.
-        async fn io<F>(&mut self, mut f: F) -> Result<i32, TlsError>
+        async fn try_io<F>(&mut self, mut f: F) -> Result<Option<i32>, TlsError>
         where
             F: FnMut(*mut mbedtls_ssl_context) -> i32,
         {
-            loop {
-                // If there is an outstanding byte, we really need to push it down the wire first
-                // before we call `poll_fn` below. Otherwise, the bytes generated by `poll_fn` and emplaced
-                // in the socket write buffer would be send _before_ our outstanding byte
-                //
-                // It is another topic that this usually should not happen, as we are calling `flush_write` also
-                // _after_ the `poll_fn` call, but in the rare case where the user cancels this function (drops the future)
-                // and then re-tries the call, the outstanding byte will not be written so it needs to be re-tried here.
-                self.flush_write().await?;
+            let outcome = core::future::poll_fn(|cx| PollCtx::poll(self, cx, &mut f)).await?;
 
-                let outcome = core::future::poll_fn(|cx| PollCtx::poll(self, cx, &mut f)).await?;
-
-                match outcome {
-                    PollOutcome::Success(res) => {
-                        self.flush_write().await?;
-                        break Ok(res);
-                    }
-                    PollOutcome::Retry => continue,
-                    PollOutcome::WantRead => self.wait_read().await?,
-                    PollOutcome::WantWrite => continue,
-                    PollOutcome::Eof => {
-                        self.state = SessionState::Eof;
-                        break Ok(0);
-                    }
+            match outcome {
+                PollOutcome::Success(res) => Ok(Some(res)),
+                PollOutcome::Retry => Ok(None),
+                PollOutcome::WantRead => Ok(None),
+                PollOutcome::WantWrite => Ok(None),
+                PollOutcome::Eof => {
+                    self.state = SessionState::Eof;
+                    Ok(Some(0))
                 }
             }
-        }
-
-        /// Wait for the stream to be readable
-        ///
-        /// Since the `Session` is implemented purely with the `Read` trait, this method
-        /// will read a single byte from the stream, so that the `Read` trait can be polled
-        async fn wait_read(&mut self) -> Result<(), TlsError> {
-            if self.read_byte.is_none() {
-                let mut buf = [0];
-
-                let len = self
-                    .stream
-                    .read(&mut buf)
-                    .await
-                    .map_err(|e| TlsError::Io(e.kind()))?;
-                if len > 0 {
-                    self.read_byte = Some(buf[0]);
-                } else {
-                    // len = 0 means the other party abruptly closed the socket
-                    // For now, return an error as this is not the nice `MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY`
-                    // case, but re-consider this in future
-                    Err(TlsError::Eof)?;
-                }
-            }
-
-            Ok(())
-        }
-
-        /// Wait for the stream to be writable
-        ///
-        /// Since the `Session` is implemented purely with the `Write` trait, this method
-        /// will write a single byte to the stream (provided by the "mbio" MbedTLS callbacks),
-        /// so that the `Write` trait can be polled
-        async fn flush_write(&mut self) -> Result<(), TlsError> {
-            if let Some(byte) = self.write_byte.as_ref().copied() {
-                let data = [byte];
-                let len = self
-                    .stream
-                    .write(&data)
-                    .await
-                    .map_err(|e| TlsError::Io(e.kind()))?;
-                if len > 0 {
-                    self.write_byte.take();
-                } else {
-                    // len = 0 means the other party abruptly closed the socket
-                    // For now, return an error as this is not the nice `MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY`
-                    // case, but re-consider this in future
-                    Err(TlsError::Eof)?;
-                }
-            }
-
-            Ok(())
-        }
-    }
-
-    impl<T> embedded_io_async::ErrorType for Session<'_, T>
-    where
-        T: embedded_io_async::ErrorType,
-    {
-        type Error = TlsError;
-    }
-
-    impl<T> embedded_io_async::Read for Session<'_, T>
-    where
-        T: embedded_io_async::Read + embedded_io_async::Write,
-    {
-        async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-            self.read(buf).await
-        }
-    }
-
-    impl<T> embedded_io_async::Write for Session<'_, T>
-    where
-        T: embedded_io_async::Read + embedded_io_async::Write,
-    {
-        async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-            self.write(buf).await
-        }
-
-        async fn flush(&mut self) -> Result<(), Self::Error> {
-            self.flush().await
         }
     }
 
@@ -1340,7 +1325,10 @@ pub mod asynch {
 
     impl<'s, 'a, 'c, 'q, T> PollCtx<'s, 'a, 'c, 'q, T>
     where
-        T: embedded_io_async::Read + embedded_io_async::Write,
+        T: embedded_io_async::Read
+            + embedded_io_async::ReadReady
+            + embedded_io_async::Write
+            + embedded_io_async::WriteReady,
     {
         fn poll<F>(
             session: &'s mut Session<'a, T>,
@@ -1418,46 +1406,66 @@ pub mod asynch {
                 return 0;
             }
 
-            if self.session.write_byte.is_some() {
-                // We have a byte to write from the previous call
-                // Indicate to the `Session` instance that it needs to write it
-                return MBEDTLS_ERR_SSL_WANT_WRITE;
+            {
+                let fut = pin!(self.session.stream.flush());
+                match fut.poll(self.context) {
+                    Poll::Ready(Ok(())) => {}
+                    Poll::Ready(Err(err)) => {
+                        ::log::warn!("TCP error: {:?}", err);
+                        self.io_result = Some(Err(TlsError::Io(err.kind())));
+                        return MBEDTLS_ERR_SSL_WANT_WRITE;
+                    }
+                    Poll::Pending => {
+                        self.io_result = Some(Ok(()));
+                        return MBEDTLS_ERR_SSL_WANT_WRITE;
+                    }
+                }
+            };
+
+            match self.session.stream.write_ready() {
+                Ok(true) => {}
+                Ok(false) => {
+                    return MBEDTLS_ERR_SSL_WANT_WRITE;
+                }
+                Err(err) => {
+                    // MbedTLS error
+                    ::log::warn!("TCP error: {:?}", err);
+                    self.io_result = Some(Err(TlsError::Io(err.kind())));
+                    return MBEDTLS_ERR_SSL_WANT_WRITE;
+                }
             }
 
             // Poll the `write` future by trying to immediately send (part of) the MbedTLS write data
             // into the network stack buffers
             let fut = pin!(self.session.stream.write(buf));
 
-            if let Poll::Ready(result) = fut.poll(self.context) {
-                match result {
-                    Ok(len) => {
-                        // Success!
+            match fut.poll(self.context) {
+                Poll::Ready(Ok(len)) => {
+                    // Success!
 
-                        if len == 0 {
-                            // The stream has reached EOF
-                            self.session.state = SessionState::Eof;
-                            self.io_result = Some(Err(TlsError::Eof));
-                            ::log::warn!("IO error: EOF");
-                        } else {
-                            // The write was successful, indicate so
-                            self.io_result = Some(Ok(()));
-                        }
+                    if len == 0 {
+                        // The stream has reached EOF
+                        self.session.state = SessionState::Eof;
+                        self.io_result = Some(Err(TlsError::Eof));
+                        ::log::warn!("IO error: EOF");
+                    } else {
+                        // The write was successful, indicate so
+                        self.io_result = Some(Ok(()));
+                    }
 
-                        len as _
-                    }
-                    Err(err) => {
-                        // MbedTLS error
-                        ::log::warn!("TCP error: {:?}", err.kind());
-                        self.io_result = Some(Err(TlsError::Io(err.kind())));
-                        MBEDTLS_ERR_SSL_WANT_WRITE
-                    }
+                    len as _
                 }
-            } else {
-                // Network write buffers are full, indicate to the `Session` instance that
-                // it needs to write-await
-                // Also give it one byte of the TLS data so that it can call `Write::write` on something
-                self.session.write_byte = Some(buf[0]);
-                1
+                Poll::Ready(Err(err)) => {
+                    // MbedTLS error
+                    ::log::warn!("TCP error: {:?}", err);
+                    self.io_result = Some(Err(TlsError::Io(err.kind())));
+                    MBEDTLS_ERR_SSL_WANT_WRITE
+                }
+                Poll::Pending => {
+                    ::log::warn!("TCP send would block");
+                    self.io_result = Some(Ok(()));
+                    MBEDTLS_ERR_SSL_WANT_WRITE
+                }
             }
         }
 
@@ -1469,56 +1477,59 @@ pub mod asynch {
                 return 0;
             }
 
-            let offset = if let Some(byte) = self.session.read_byte.take() {
-                // We have one byte read from the `Session` async context, give it
-                // to MbedTLS
-                buf[0] = byte;
-                1
-            } else {
-                0
+            {
+                let fut = pin!(self.session.stream.flush());
+                match fut.poll(self.context) {
+                    Poll::Ready(Ok(())) => {}
+                    Poll::Ready(Err(err)) => {
+                        ::log::warn!("TCP error: {:?}", err);
+                        self.io_result = Some(Err(TlsError::Io(err.kind())));
+                        return MBEDTLS_ERR_SSL_WANT_READ;
+                    }
+                    Poll::Pending => {}
+                }
             };
 
-            if buf.len() == offset {
-                // MbedTLS requested only one byte anyway
-                return offset as _;
+            match self.session.stream.read_ready() {
+                Ok(true) => {}
+                Ok(false) => {
+                    return MBEDTLS_ERR_SSL_WANT_READ;
+                }
+                Err(err) => {
+                    // MbedTLS error
+                    ::log::warn!("TCP error: {:?}", err);
+                    self.io_result = Some(Err(TlsError::Io(err.kind())));
+                    return MBEDTLS_ERR_SSL_WANT_READ;
+                }
             }
 
-            let fut = pin!(self.session.stream.read(&mut buf[offset..]));
+            let fut = pin!(self.session.stream.read(buf));
 
-            if let Poll::Ready(result) = fut.poll(self.context) {
-                match result {
-                    Ok(len) => {
-                        // Success!
+            match fut.poll(self.context) {
+                Poll::Ready(Ok(len)) => {
+                    // Success!
 
-                        let len = len + offset;
-
-                        if len == 0 {
-                            // The stream has reached EOF
-                            self.session.state = SessionState::Eof;
-                            self.io_result = Some(Err(TlsError::Eof));
-                            ::log::warn!("IO error: EOF");
-                        } else {
-                            // The read was successful, indicate so
-                            self.io_result = Some(Ok(()));
-                        }
-
-                        len as _
+                    if len == 0 {
+                        // The stream has reached EOF
+                        self.session.state = SessionState::Eof;
+                        self.io_result = Some(Err(TlsError::Eof));
+                        ::log::warn!("IO error: EOF");
+                    } else {
+                        // The read was successful, indicate so
+                        self.io_result = Some(Ok(()));
                     }
-                    Err(err) => {
-                        // MbedTLS error
-                        ::log::warn!("TCP error: {:?}", err.kind());
-                        self.io_result = Some(Err(TlsError::Io(err.kind())));
-                        MBEDTLS_ERR_SSL_WANT_READ
-                    }
+
+                    len as _
                 }
-            } else {
-                // Network read buffers are empty, either return the single byte we have
-                // or indicate to the `Session` async context, that it needs to invoke `read` on the
-                // `Read` trait
-                if offset == 0 {
+                Poll::Ready(Err(err)) => {
+                    // MbedTLS error
+                    ::log::warn!("TCP error: {:?}", err);
+                    self.io_result = Some(Err(TlsError::Io(err.kind())));
                     MBEDTLS_ERR_SSL_WANT_READ
-                } else {
-                    offset as _
+                }
+                Poll::Pending => {
+                    ::log::warn!("TCP recv would block");
+                    MBEDTLS_ERR_SSL_WANT_READ
                 }
             }
         }
