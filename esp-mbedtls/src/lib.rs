@@ -1073,10 +1073,15 @@ pub mod asynch {
                 SessionState::Initial => {
                     log::debug!("Establishing SSL connection");
 
-                    while let None = session
-                        .try_io(|ssl| unsafe { mbedtls_ssl_handshake(ssl) })
-                        .await?
-                    {
+                    loop {
+                        {
+                            if let Some(..) = session
+                                .try_io(|ssl| unsafe { mbedtls_ssl_handshake(ssl) })
+                                .await?
+                            {
+                                break;
+                            }
+                        };
                         yield_now().await;
                     }
 
@@ -1106,21 +1111,20 @@ pub mod asynch {
             self.connect().await?;
 
             let len = loop {
-                match self
-                    .session
-                    .lock()
-                    .await
-                    .try_io(|ssl| unsafe {
-                        mbedtls_ssl_read(ssl, buf.as_mut_ptr() as *mut _, buf.len() as _)
-                    })
-                    .await?
                 {
-                    Some(len) => break len as usize,
-                    None => {
-                        yield_now().await;
-                        continue;
+                    if let Some(len) = self
+                        .session
+                        .lock()
+                        .await
+                        .try_io(|ssl| unsafe {
+                            mbedtls_ssl_read(ssl, buf.as_mut_ptr() as *mut _, buf.len() as _)
+                        })
+                        .await?
+                    {
+                        break len as usize;
                     }
                 }
+                yield_now().await;
             };
 
             Ok(len as _)
@@ -1139,21 +1143,20 @@ pub mod asynch {
             self.connect().await?;
 
             let len = loop {
-                match self
-                    .session
-                    .lock()
-                    .await
-                    .try_io(|ssl| unsafe {
-                        mbedtls_ssl_write(ssl, data.as_ptr() as *const _, data.len() as _)
-                    })
-                    .await?
                 {
-                    Some(len) => break len as usize,
-                    None => {
-                        yield_now().await;
-                        continue;
+                    if let Some(len) = self
+                        .session
+                        .lock()
+                        .await
+                        .try_io(|ssl| unsafe {
+                            mbedtls_ssl_write(ssl, data.as_ptr() as *const _, data.len() as _)
+                        })
+                        .await?
+                    {
+                        break len as usize;
                     }
-                }
+                };
+                yield_now().await;
             };
 
             Ok(len as _)
@@ -1189,10 +1192,15 @@ pub mod asynch {
 
             let mut session = self.session.lock().await;
 
-            while let None = session
-                .try_io(|ssl| unsafe { mbedtls_ssl_close_notify(ssl) })
-                .await?
-            {
+            loop {
+                {
+                    if let Some(..) = session
+                        .try_io(|ssl| unsafe { mbedtls_ssl_close_notify(ssl) })
+                        .await?
+                    {
+                        break;
+                    }
+                };
                 yield_now().await;
             }
 
